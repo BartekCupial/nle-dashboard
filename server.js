@@ -1,36 +1,15 @@
 // Copyright (c) Facebook, Inc. and its affiliates.
 const path = require('path');
-const parse = require('csv-parse/lib/sync');
 const express = require('express');
 const readLastLines = require('read-last-lines');
 const compression = require('compression');
-const readdirp = require('readdirp');
-const clonedeep = require('lodash.clonedeep');
-const AdmZip = require('adm-zip');
 const tmp = require('tmp');
 const config = require('./config');
+const dfd = require("danfojs-node")
+const { execSync } = require('child_process');
 
 app = express();
 app.use(compression({filter: () => true}));
-
-/** Filter empty lines or lines with empty fields.
- * Also populate the stats_file field if the runs were loaded recursively.
- */
-function processLines(linesStr, recursively, statsFile, dataFile) {
-  // Break the string at newlines, to get a list of strings.
-  const lines = linesStr.split(/\r?\n/);
-  const kept = [];
-  for (let line of lines) {
-    if (!line.includes('end_status,score,') && line !== '') {
-      if (recursively) {
-        line += `,${statsFile}`;
-      }
-      line += `,${dataFile}`,
-      kept.push(line);
-    }
-  }
-  return kept;
-}
 
 /** Gets a list of available runs, with related information.
  * The files are searched in dataPath (possibily exploring
@@ -44,54 +23,35 @@ function processLines(linesStr, recursively, statsFile, dataFile) {
 async function getRunsInfo(dataPath, readLast, recursively) {
   console.log(`Trying to read ${readLast} runs from folder: ${dataPath}.`);
 
-  const header = clonedeep(config.statsHeaders);
-  let statsFiles = [];
-  if (recursively) {
-    const settings = {
-      type: 'files',
-      fileFilter: [config.data.stats],
-    };
-    statsFiles = await readdirp.promise(dataPath, settings);
-    statsFiles = statsFiles.map((statsFile) => statsFile.fullPath);
-    console.log(`Stats files recursively found:\n${statsFiles}`);
-    header.push('stats_file');
-    header.push('data_file');
-  } else {
-    statsFiles = [path.join(dataPath, config.data.stats)];
-    header.push('data_file');
+  try {
+      let df = await dfd.readCSV(dataPath); // Use await to wait for the promise to resolve
+
+      df = df.rename(
+        { 
+          "death": "end_status",
+          "max_hitpoints": "hp",
+          "len": "steps",
+          "experience_level": "xplvl",
+          "sokobanfillpit_score": "sokoban",
+        }
+      );
+
+      let valuesToRemove = ["end_status", "score", "steps", "turns", "hp", "dlvl", "sokoban", "role", "race", "gender", "ttyrecname"];
+      let filteredArray = df.columns.filter(value => !valuesToRemove.includes(value));
+      df = df.drop({ columns: filteredArray });
+      df = df.addColumn("ttyrec", df["ttyrecname"].map(value => {
+        const dirname = path.dirname(dataPath);
+        const fullPath = path.join(dirname, "nle_data", value);
+        return fullPath;
+      }));
+      console.log(`Found ${df.shape[0]} runs.`);
+
+      return df;
+
+  } catch (err) {
+      console.log(err);
+      return null;
   }
-
-  // List of strings, each one containing a line.
-  let allLines = [];
-  for (const statsFile of statsFiles) {
-    dataFilePath = path.parse(statsFile);
-    dataFile = path.format({
-      dir: dataFilePath.dir,
-      name: dataFilePath.name,
-      ext: '.zip',
-    });
-
-    // Read and filter the last lines from each statsFile.
-    // The factor 2 is necessary because this library counts every line as two.
-    allLines = allLines.concat(await readLastLines.read(statsFile, 2 * readLast)
-        .then((lines) => {
-          return processLines(lines, recursively, statsFile, dataFile);
-        }));
-  }
-
-  // Add header to the lines.
-  // The header size has to be the same number of fields as the data,
-  // otherwise you may get no output from the csv parser.
-  allLines.splice(0, 0, header.join(','));
-
-  // Read the data as a csv.
-  const runsInfo = parse(allLines.join('\n'), {
-    columns: true,
-    skip_empty_lines: true,
-    comment: '#',
-  });
-  console.log(`Found ${runsInfo.length} runs.`);
-  return runsInfo;
 }
 
 /** Creates meaningful error messages with a standard format.
@@ -134,7 +94,7 @@ app.get('/runs_info', (req, res) => {
   getRunsInfo(dataPath, readLast, recursively)
       .then((runsInfo) => {
         res.set('Content-Type', 'application/json');
-        res.status(200).send(JSON.stringify(runsInfo));
+        res.status(200).send(dfd.toJSON(runsInfo));
       })
       .catch((error) => {
         if (error.message == 'file does not exist') {
@@ -177,19 +137,21 @@ app.get('/ttyrec_file', (req, res) => {
     const ttyrecname = decodeURIComponent(req.query.ttyrec);
     let datapath = decodeURIComponent(req.query.datapath);
 
-    if (!path.isAbsolute(datapath)) {
-      // Make filepath relative to this folder.
-      console.log(`Received a relative datapath: ${datapath}. ` +
-                  `Adding this folder as prefix.`);
-      datapath = path.join(__dirname, datapath);
-    }
+    // if (!path.isAbsolute(datapath)) {
+    //   // Make filepath relative to this folder.
+    //   console.log(`Received a relative datapath: ${datapath}. ` +
+    //               `Adding this folder as prefix.`);
+    //   datapath = path.join(__dirname, datapath);
+    // }
     try {
-      // need to unzip first into a temp dir
-      const datazip = new AdmZip(datapath);
-      const name = tmp.tmpNameSync();
-      datazip.extractEntryTo(ttyrecname, name + '/');
-      const temppath = name + '/' + ttyrecname;
-      // send ttyrec over
+      let lastDotIndex = ttyrecname.lastIndexOf('.');
+      let filenameWithoutExtension = ttyrecname.substring(0, lastDotIndex);        
+      const tempDir = tmp.dirSync();
+      const temppath = path.join(tempDir.name, path.basename(filenameWithoutExtension));
+
+      execSync(`bzip2 -d -c ${ttyrecname} > ${temppath}`);
+      console.log('Decompression and write complete!');
+
       res.sendFile(temppath);
       console.log(`Serving ttyrec file: ${temppath}.`);
       // fs.unlinkSync(temppath);
